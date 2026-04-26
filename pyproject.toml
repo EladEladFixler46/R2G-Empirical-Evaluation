@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "r2g-empirical-evaluation"
+version = "0.1.0"
+description = "Empirical evaluation framework for two R2G algorithms"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Master Thesis Research" }
+]
+dependencies = [
+  "networkx>=3.2",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "scipy>=1.12"
+]
+
+[project.scripts]
+r2g-eval = "r2g_eval.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
