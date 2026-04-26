@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import pandas as pd
+import torch
 
 
 @dataclass(slots=True)
@@ -10,24 +12,16 @@ class RDBInstance:
 
     instance_id: str
     task_name: str
-    predictor_name: str
-    threshold: int
-    rows: list[dict[str, str]]
-    labels: list[int]
-    source: str
+    data: dict[str, pd.DataFrame] #each df must contain a 'ID' column, and the rest of the columns are attributes
 
 
 @dataclass(slots=True)
-class AlgorithmResult:
+class GraphInstance:
     """Output for one algorithm on one graph instance."""
 
-    algorithm: str
     instance_id: str
     task_name: str
-    predictor_name: str
-    threshold: int
-    source: str
-    wl_color: int
-    objective_score: float
-    runtime_sec: float
+    node_to_id: dict[int, str]
+    embeddings: torch.Tensor
+    edge_index: torch.Tensor
     metadata: dict[str, Any]

@@ -1,162 +1,204 @@
 from __future__ import annotations
 
+from abc import ABC
 from dataclasses import dataclass
 from time import perf_counter
 
-import networkx as nx
-
-from .models import AlgorithmResult, RDBInstance
+from models import GraphInstance, RDBInstance
 
 
 @dataclass(slots=True)
-class BaseR2GAlgorithm:
-    """Shared interface for all R2G algorithms under comparison."""
-
+class BaseR2GAlgorithm(ABC):
+    """
+    Shared interface for all Relational-to-Graph (R2G) algorithms.
+    
+    Attributes:
+        name (str): The unique identifier name of the algorithm.
+    """
     name: str
-
-    def evaluate(self, instance: RDBInstance) -> AlgorithmResult:
-        start = perf_counter()
-        wl_color, objective, metadata = self._run(instance)
-        elapsed = perf_counter() - start
-        return AlgorithmResult(
-            algorithm=self.name,
-            instance_id=instance.instance_id,
-            task_name=instance.task_name,
-            predictor_name=instance.predictor_name,
-            threshold=instance.threshold,
-            source=instance.source,
-            wl_color=wl_color,
-            objective_score=float(objective),
-            runtime_sec=elapsed,
-            metadata=metadata,
-        )
-
-    def _run(self, instance: RDBInstance) -> tuple[int, float, dict]:
+    
+    def _run(self, instance: RDBInstance) -> GraphInstance:
+        """
+        Convert a relational database instance into a graph instance.
+        
+        Args:
+            instance (RDBInstance): The input relational database data.
+            
+        Returns:
+            GraphInstance: The resulting graph.
+        """
         raise NotImplementedError
 
 
-def _joinable(row_a: dict[str, str], row_b: dict[str, str]) -> bool:
-    for attr, value in row_a.items():
-        if row_b.get(attr) == value:
-            return True
-    return False
-
-
-def _best_color_accuracy(row_colors: dict[str, int], labels: list[int]) -> float:
-    groups: dict[int, list[int]] = {}
-    for row_idx, color in row_colors.items():
-        idx = int(row_idx.split(":", maxsplit=1)[1])
-        groups.setdefault(color, []).append(labels[idx])
-
-    correct = 0
-    total = len(labels)
-    for bucket in groups.values():
-        positives = sum(bucket)
-        negatives = len(bucket) - positives
-        correct += max(positives, negatives)
-
-    return correct / total if total else 0.0
-
-
-def _wl_refinement(
-    graph: nx.Graph,
-    initial_labels: dict[str, str],
-    rounds: int = 3,
-) -> dict[str, int]:
-    current = initial_labels.copy()
-
-    for _ in range(rounds):
-        signatures: dict[str, tuple[str, tuple[str, ...]]] = {}
-        for node in graph.nodes:
-            neighbor_colors = sorted(current[nbr] for nbr in graph.neighbors(node))
-            signatures[node] = (current[node], tuple(neighbor_colors))
-
-        ordered_unique = sorted(set(signatures.values()))
-        remap = {sig: str(i) for i, sig in enumerate(ordered_unique)}
-        current = {node: remap[sig] for node, sig in signatures.items()}
-
-    color_vocab = {color: i for i, color in enumerate(sorted(set(current.values())))}
-    return {node: color_vocab[color] for node, color in current.items()}
-
-
 class DirectR2GAlgorithm(BaseR2GAlgorithm):
-    """A Direct R2G: row-node graph with edges between joinable rows."""
+    """
+    Direct Relational-to-Graph (R2G) conversion algorithm.
+    """
 
     def __init__(self) -> None:
         super().__init__(name="r2g_direct")
 
-    def _run(self, instance: RDBInstance) -> tuple[int, float, dict]:
-        rows = instance.rows
-        if not rows:
-            return 0, 0.0, {"reason": "empty_graph"}
+    def _run(self, instance: RDBInstance) -> GraphInstance:
+        import torch
+        import pandas as pd
+        import numpy as np
 
-        graph = nx.Graph()
-        row_nodes = [f"r:{i}" for i in range(len(rows))]
-        graph.add_nodes_from(row_nodes)
+        df_list = []
+        global_row_idx = 0
+        node_to_id = {}
 
-        for i in range(len(rows)):
-            for j in range(i + 1, len(rows)):
-                if _joinable(rows[i], rows[j]):
-                    graph.add_edge(f"r:{i}", f"r:{j}")
+        for df_name, df in instance.data.items():
+            temp_df = df.copy()
+            n_rows = len(temp_df)
+            
+            # Numpy arange generates sequential indices instantly
+            temp_idx = np.arange(global_row_idx, global_row_idx + n_rows)
+            temp_df['__global_idx'] = temp_idx
+            
+            # Fast dictionary mapping for IDs
+            node_to_id.update(dict(zip(temp_idx, temp_df['ID'].astype(str))))
+            
+            global_row_idx += n_rows
+            df_list.append(temp_df)
 
-        initial = {node: "row" for node in row_nodes}
-        wl = _wl_refinement(graph, initial_labels=initial, rounds=3)
-        row_colors = {node: wl[node] for node in row_nodes}
+        if not df_list:
+            return GraphInstance(
+                instance_id=instance.instance_id,
+                task_name=instance.task_name,
+                node_to_id={},
+                embeddings=torch.zeros((0, 1)),
+                edge_index=torch.empty((2, 0), dtype=torch.long),
+                metadata={"num_nodes": 0}
+            )
 
-        unique_labels = len(set(row_colors.values()))
-        objective = _best_color_accuracy(row_colors, instance.labels)
-        wl_color = max(1, unique_labels)
-        metadata = {
-            "representation": "direct",
-            "row_count": len(rows),
-            "unique_row_wl_colors": unique_labels,
-        }
-        return wl_color, objective, metadata
+        combined_df = pd.concat(df_list, ignore_index=True)
+        num_nodes = len(combined_df)
+        cols_to_melt = [c for c in combined_df.columns if c not in ['ID', '__global_idx']]
+        
+        # Pandas melt vectorization: converts rows to (idx, attribute, value) instantly
+        melted = combined_df.melt(id_vars=['__global_idx'], value_vars=cols_to_melt, 
+                                  var_name='attribute', value_name='value')
+        melted = melted.dropna(subset=['value'])
+
+        # Pandas merge: vectorized relational join perfectly replaces the O(N^2) loops 
+        # for finding rows that share the same value in the same column
+        merged = pd.merge(melted, melted, on=['attribute', 'value'])
+        
+        # Boolean indexing to remove self-loops efficiently
+        edges = merged[merged['__global_idx_x'] != merged['__global_idx_y']]
+        
+        # Drop duplicates in case multiple columns matched between the same two rows
+        edges = edges[['__global_idx_x', '__global_idx_y']].drop_duplicates()
+
+        if len(edges) > 0:
+            edges_src = edges['__global_idx_x'].values
+            edges_dst = edges['__global_idx_y'].values
+            # Numpy vstack pushes arrays directly to torch, avoiding loops
+            edge_index = torch.tensor(np.vstack((edges_src, edges_dst)), dtype=torch.long)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        embeddings = torch.zeros((num_nodes, 1))
+
+        return GraphInstance(
+            instance_id=instance.instance_id,
+            task_name=instance.task_name,
+            node_to_id=node_to_id,
+            embeddings=embeddings,
+            edge_index=edge_index,
+            metadata={"num_nodes": num_nodes}
+        )
 
 
 class IndirectR2GAlgorithm(BaseR2GAlgorithm):
-    """A Indirect R2G: row nodes + attribute-value nodes (bipartite)."""
+    """
+    Indirect Relational-to-Graph (R2G) conversion algorithm.
+    Optimized with pandas and numpy vectorization.
+    """
 
     def __init__(self) -> None:
         super().__init__(name="r2g_indirect")
 
-    def _run(self, instance: RDBInstance) -> tuple[int, float, dict]:
-        rows = instance.rows
-        if not rows:
-            return 0, 0.0, {"reason": "empty_graph"}
+    def _run(self, instance: RDBInstance) -> GraphInstance:
+        import torch
+        import pandas as pd
+        import numpy as np
 
-        graph = nx.Graph()
-        row_nodes = [f"r:{i}" for i in range(len(rows))]
-        graph.add_nodes_from(row_nodes)
+        df_list = []
+        global_row_idx = 0
+        node_to_id = {}
 
-        av_nodes: set[str] = set()
-        for i, row in enumerate(rows):
-            row_node = f"r:{i}"
-            for attr, value in row.items():
-                av = f"av:{attr}:{value}"
-                av_nodes.add(av)
-                graph.add_edge(row_node, av)
+        for df_name, df in instance.data.items():
+            temp_df = df.copy()
+            n_rows = len(temp_df)
+            temp_idx = np.arange(global_row_idx, global_row_idx + n_rows)
+            temp_df['__global_idx'] = temp_idx
+            node_to_id.update(dict(zip(temp_idx, temp_df['ID'].astype(str))))
+            global_row_idx += n_rows
+            df_list.append(temp_df)
 
-        initial: dict[str, str] = {node: "row" for node in row_nodes}
-        for node in av_nodes:
-            initial[node] = "attr_value"
+        if not df_list:
+            return GraphInstance(
+                instance_id=instance.instance_id,
+                task_name=instance.task_name,
+                node_to_id={},
+                embeddings=torch.zeros((0, 1)),
+                edge_index=torch.empty((2, 0), dtype=torch.long),
+                metadata={}
+            )
 
-        wl = _wl_refinement(graph, initial_labels=initial, rounds=3)
-        row_colors = {node: wl[node] for node in row_nodes}
+        combined_df = pd.concat(df_list, ignore_index=True)
+        num_row_nodes = len(combined_df)
+        cols_to_melt = [c for c in combined_df.columns if c not in ['ID', '__global_idx']]
+        
+        # Pandas melt vectorization
+        melted = combined_df.melt(id_vars=['__global_idx'], value_vars=cols_to_melt, 
+                                  var_name='attribute', value_name='value')
+        melted = melted.dropna(subset=['value'])
 
-        unique_labels = len(set(row_colors.values()))
-        objective = _best_color_accuracy(row_colors, instance.labels)
-        wl_color = max(1, unique_labels)
-        metadata = {
-            "representation": "indirect",
-            "row_count": len(rows),
-            "attr_value_nodes": len(av_nodes),
-            "unique_row_wl_colors": unique_labels,
-        }
-        return wl_color, objective, metadata
+        # Pandas string vectorization: concatenate columns rapidly without loops
+        melted['cv_str'] = melted['attribute'].astype(str) + "=" + melted['value'].astype(str)
+        
+        # Numpy unique extracts all distinct Attribute-Value pairs instantly
+        unique_cvs = melted['cv_str'].unique()
+        num_cv_nodes = len(unique_cvs)
+        
+        cv_idx_range = np.arange(num_row_nodes, num_row_nodes + num_cv_nodes)
+        cv_to_idx = dict(zip(unique_cvs, cv_idx_range))
+        node_to_id.update(dict(zip(cv_idx_range, unique_cvs)))
+
+        # Pandas map assigns the new node IDs across all rows efficiently
+        melted['cv_idx'] = melted['cv_str'].map(cv_to_idx)
+
+        if len(melted) > 0:
+            edges_src = melted['__global_idx'].values
+            edges_dst = melted['cv_idx'].values
+            
+            # Numpy concatenate to create undirected edges (src->dst and dst->src)
+            all_src = np.concatenate([edges_src, edges_dst])
+            all_dst = np.concatenate([edges_dst, edges_src])
+            edge_index = torch.tensor(np.vstack((all_src, all_dst)), dtype=torch.long)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        total_nodes = num_row_nodes + num_cv_nodes
+        embeddings = torch.zeros((total_nodes, 1))
+
+        return GraphInstance(
+            instance_id=instance.instance_id,
+            task_name=instance.task_name,
+            node_to_id=node_to_id,
+            embeddings=embeddings,
+            edge_index=edge_index,
+            metadata={"num_row_nodes": num_row_nodes, "num_cv_nodes": num_cv_nodes}
+        )
 
 
 def get_default_algorithms() -> list[BaseR2GAlgorithm]:
-    """Return the two R2G implementations used in the experiments."""
-
+    """
+    Retrieve the standard set of R2G implementations for evaluation.
+    
+    Returns:
+        list[BaseR2GAlgorithm]: A list containing the Direct and Indirect algorithm instances.
+    """
     return [DirectR2GAlgorithm(), IndirectR2GAlgorithm()]
