@@ -12,7 +12,7 @@ def main():
         n_cols=4, 
         n_categories=8, 
         rng_seed=42, 
-        name_prefix="embedded_synthetic"
+        name_prefix="synthetic"
     )
     test_gen = EmbeddingDataGenerator(
         n_instances=200, 
@@ -20,14 +20,14 @@ def main():
         n_cols=4, 
         n_categories=8, 
         rng_seed=99, 
-        name_prefix="embedded_synthetic"
+        name_prefix="synthetic"
     )
 
 
     # problem_gen = MoreThanNeighborsProblemGenerator(N=12)
     problem_gen = SharedAttributesProblemGenerator(N=3)
   
-    config = TrainingConfig(hidden_dim=32, num_layers=3, lr=1e-2, epochs=80, batch_size=128)
+    config = TrainingConfig(hidden_dim=32, num_layers=3, lr=1e-2, epochs=100, batch_size=16)
     algorithms = get_default_algorithms()
     
     experiment = ExperimentRunner(
