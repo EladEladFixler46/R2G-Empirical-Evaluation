@@ -25,3 +25,12 @@ class GraphInstance:
     embeddings: torch.Tensor
     edge_index: torch.Tensor
     metadata: dict[str, Any]
+
+@dataclass(slots=True)
+class ProblemInstance:
+    """Defines a problem instance for evaluation, including the RDB instance and the expected graph properties."""
+    
+    instance_id: str
+    task_name: str
+    rdb_instance: RDBInstance
+    expected_properties: dict[str, float] # must be the ID of the row and the expected value of the property for that node
