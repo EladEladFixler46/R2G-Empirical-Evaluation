@@ -97,7 +97,6 @@ def _problem_to_labelled_pyg(
     id_to_node: dict[str, int] = {v: k for k, v in gi.node_to_id.items()}
 
     if pi.expected_properties:
-        # Vectorized lookup instead of dict item loop
         keys = np.array(list(pi.expected_properties.keys()))
         vals = np.array(list(pi.expected_properties.values()))
         
@@ -152,14 +151,21 @@ class TrainedMPNNModel:
 # 5.  Training
 # ──────────────────────────────────────────────
 
+def _get_default_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
 @dataclass
 class TrainingConfig:
     hidden_dim:  int   = 32
     num_layers:  int   = 3
     lr:          float = 1e-2
     epochs:      int   = 50
-    batch_size:  int   = 32     # Added parameter for DataLoader
-    device:      str   = "cpu"
+    batch_size:  int   = 32     
+    device:      str   = field(default_factory=_get_default_device)
 
 
 def train(
@@ -175,19 +181,19 @@ def train(
         config = TrainingConfig()
 
     device = torch.device(config.device)
+    print(f"Training on device: {device}")
 
     print("Pre-converting training graphs ...")
     train_data = [_problem_to_labelled_pyg(p, algorithm)[0] for p in train_problems]
     print("Pre-converting test graphs ...")
     test_data  = [_problem_to_labelled_pyg(p, algorithm)[0] for p in test_problems]
 
-    # Convert to DataLoaders for massive speedup via batching
     from torch_geometric.loader import DataLoader
     train_loader = DataLoader(train_data, batch_size=config.batch_size, shuffle=True)
     test_loader = DataLoader(test_data, batch_size=config.batch_size, shuffle=False)
 
     mpnn = MPNN(
-        in_channels=1, 
+        in_channels=1 if not hasattr(train_data[0], 'x') or train_data[0].x.shape[1] == 0 else train_data[0].x.shape[1], 
         hidden_dim=config.hidden_dim, 
         num_layers=config.num_layers
     ).to(device)
@@ -319,7 +325,6 @@ def evaluate(
             if not pi.expected_properties:
                 continue
 
-            # Vectorized numpy extraction
             keys = np.array(list(pi.expected_properties.keys()))
             vals = np.array(list(pi.expected_properties.values()))
             

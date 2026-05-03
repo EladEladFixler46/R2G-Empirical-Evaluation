@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 import pandas as pd
 import torch
@@ -12,7 +12,8 @@ class RDBInstance:
 
     instance_id: str
     task_name: str
-    data: dict[str, pd.DataFrame] #each df must contain a 'ID' column, and the rest of the columns are attributes
+    data: dict[str, pd.DataFrame] 
+    fkeys: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -28,9 +29,9 @@ class GraphInstance:
 
 @dataclass(slots=True)
 class ProblemInstance:
-    """Defines a problem instance for evaluation, including the RDB instance and the expected graph properties."""
+    """Defines a problem instance for evaluation."""
     
     instance_id: str
     task_name: str
     rdb_instance: RDBInstance
-    expected_properties: dict[str, float] # must be the ID of the row and the expected value of the property for that node
+    expected_properties: dict[str, float]

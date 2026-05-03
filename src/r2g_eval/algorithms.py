@@ -23,7 +23,6 @@ class BaseR2GAlgorithm(ABC):
 class DirectR2GAlgorithm(BaseR2GAlgorithm):
     """
     Direct Relational-to-Graph (R2G) conversion algorithm.
-    Supports node-level embeddings from RDB column.
     """
 
     def __init__(self) -> None:
@@ -33,15 +32,21 @@ class DirectR2GAlgorithm(BaseR2GAlgorithm):
         df_list = []
         global_row_idx = 0
         node_to_id = {}
+        global_idx_map = {}
+        augmented_dfs = {}  # מילון לשמירת הטבלאות עם האינדקסים הגלובליים
 
         for df_name, df in instance.data.items():
             temp_df = df.copy()
             n_rows = len(temp_df)
             temp_idx = np.arange(global_row_idx, global_row_idx + n_rows)
             temp_df['__global_idx'] = temp_idx
+            
             node_to_id.update(dict(zip(temp_idx, temp_df['ID'].astype(str))))
+            global_idx_map[df_name] = pd.Series(temp_idx, index=temp_df['ID'].astype(str))
+            
             global_row_idx += n_rows
             df_list.append(temp_df)
+            augmented_dfs[df_name] = temp_df  # שומרים את העותק המעודכן
 
         if not df_list:
             return GraphInstance(
@@ -79,6 +84,42 @@ class DirectR2GAlgorithm(BaseR2GAlgorithm):
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
 
+        fk_src_list = []
+        fk_dst_list = []
+        
+        for df_name, table_fkeys in getattr(instance, 'fkeys', {}).items():
+            if df_name not in augmented_dfs:
+                continue
+            df = augmented_dfs[df_name]  # משתמשים בטבלה המעודכנת שמכילה את האינדקס
+            for fk_col, target_table in table_fkeys.items():
+                if fk_col not in df.columns or target_table not in global_idx_map:
+                    continue
+                
+                target_map = global_idx_map[target_table]
+                mask = df[fk_col].notna()
+                if not mask.any():
+                    continue
+                
+                fk_vals = df.loc[mask, fk_col].astype(str)
+                valid_mask = fk_vals.isin(target_map.index)
+                
+                if not valid_mask.any():
+                    continue
+                
+                valid_src = df.loc[mask][valid_mask]['__global_idx'].values
+                valid_fk_vals = fk_vals[valid_mask]
+                valid_dst = target_map[valid_fk_vals].values
+                
+                fk_src_list.append(valid_src)
+                fk_dst_list.append(valid_dst)
+                
+        if fk_src_list:
+            all_fk_src = np.concatenate(fk_src_list)
+            all_fk_dst = np.concatenate(fk_dst_list)
+            fk_edge_index = torch.tensor(np.vstack((all_fk_src, all_fk_dst)), dtype=torch.long)
+            fk_edge_index_rev = torch.tensor(np.vstack((all_fk_dst, all_fk_src)), dtype=torch.long)
+            edge_index = torch.cat([edge_index, fk_edge_index, fk_edge_index_rev], dim=1)
+
         return GraphInstance(
             instance_id=instance.instance_id,
             task_name=instance.task_name,
@@ -92,7 +133,6 @@ class DirectR2GAlgorithm(BaseR2GAlgorithm):
 class IndirectR2GAlgorithm(BaseR2GAlgorithm):
     """
     Indirect Relational-to-Graph (R2G) conversion algorithm.
-    Supports node-level embeddings and value-node initialization flags.
     """
 
     def __init__(self, use_val_as_embedding: bool = False) -> None:
@@ -103,15 +143,21 @@ class IndirectR2GAlgorithm(BaseR2GAlgorithm):
         df_list = []
         global_row_idx = 0
         node_to_id = {}
+        global_idx_map = {}
+        augmented_dfs = {}  # מילון לשמירת הטבלאות עם האינדקסים הגלובליים
 
         for df_name, df in instance.data.items():
             temp_df = df.copy()
             n_rows = len(temp_df)
             temp_idx = np.arange(global_row_idx, global_row_idx + n_rows)
             temp_df['__global_idx'] = temp_idx
+            
             node_to_id.update(dict(zip(temp_idx, temp_df['ID'].astype(str))))
+            global_idx_map[df_name] = pd.Series(temp_idx, index=temp_df['ID'].astype(str))
+            
             global_row_idx += n_rows
             df_list.append(temp_df)
+            augmented_dfs[df_name] = temp_df  # שומרים את העותק המעודכן
 
         if not df_list:
             return GraphInstance(
@@ -170,6 +216,42 @@ class IndirectR2GAlgorithm(BaseR2GAlgorithm):
             edge_index = torch.tensor(np.vstack((all_src, all_dst)), dtype=torch.long)
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        fk_src_list = []
+        fk_dst_list = []
+        
+        for df_name, table_fkeys in getattr(instance, 'fkeys', {}).items():
+            if df_name not in augmented_dfs:
+                continue
+            df = augmented_dfs[df_name]  # משתמשים בטבלה המעודכנת שמכילה את האינדקס
+            for fk_col, target_table in table_fkeys.items():
+                if fk_col not in df.columns or target_table not in global_idx_map:
+                    continue
+                
+                target_map = global_idx_map[target_table]
+                mask = df[fk_col].notna()
+                if not mask.any():
+                    continue
+                
+                fk_vals = df.loc[mask, fk_col].astype(str)
+                valid_mask = fk_vals.isin(target_map.index)
+                
+                if not valid_mask.any():
+                    continue
+                
+                valid_src = df.loc[mask][valid_mask]['__global_idx'].values
+                valid_fk_vals = fk_vals[valid_mask]
+                valid_dst = target_map[valid_fk_vals].values
+                
+                fk_src_list.append(valid_src)
+                fk_dst_list.append(valid_dst)
+                
+        if fk_src_list:
+            all_fk_src = np.concatenate(fk_src_list)
+            all_fk_dst = np.concatenate(fk_dst_list)
+            fk_edge_index = torch.tensor(np.vstack((all_fk_src, all_fk_dst)), dtype=torch.long)
+            fk_edge_index_rev = torch.tensor(np.vstack((all_fk_dst, all_fk_src)), dtype=torch.long)
+            edge_index = torch.cat([edge_index, fk_edge_index, fk_edge_index_rev], dim=1)
 
         return GraphInstance(
             instance_id=instance.instance_id,
