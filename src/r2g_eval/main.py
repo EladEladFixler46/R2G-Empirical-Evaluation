@@ -2,12 +2,15 @@ import os
 import pickle
 import pandas as pd
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from typing import List, Any
 
 from r2g_eval.data_generators import EmbeddingDataGenerator, RandomDataGenerator, DataGenerator
 from r2g_eval.experiment import ExperimentRunner
 from r2g_eval.mpnn_trainer import TrainingConfig
-from r2g_eval.problems import ProblemGenerator, SharedAttributesProblemGenerator
+from r2g_eval.problems import MoreThanNeighborsProblemGenerator, ProblemGenerator, SharedAttributesProblemGenerator
 from r2g_eval.algorithms import get_default_algorithms
 from r2g_eval.models import RDBInstance, ProblemInstance
 
@@ -98,7 +101,6 @@ class RelBenchSimpleStackGenerator(DataGenerator):
                     if pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_bool_dtype(df[col]):
                         cols_to_keep.append(col)
                 
-                # Make sure we keep the specific columns we want for embeddings
                 if table_name == 'posts' and 'Score' in df.columns and 'Score' not in cols_to_keep:
                      cols_to_keep.append('Score')
                 if table_name == 'comments' and 'Score' in df.columns and 'Score' not in cols_to_keep:
@@ -107,10 +109,8 @@ class RelBenchSimpleStackGenerator(DataGenerator):
                 sample_size = max(1, int(len(df) * self.sample_frac))
                 sampled_df = df[cols_to_keep].sample(n=sample_size, random_state=int(rng.integers(0, 1000000)))
                 
-                # Apply simple numerical embeddings (No heavy NLP models)
                 if table_name == 'users':
-                    num_ids = pd.factorize(sampled_df['ID'])[0].astype(float)
-                    embeddings = num_ids.reshape(-1, 1).tolist()
+                    embeddings = np.ones((len(sampled_df), 1)).tolist()
                 elif table_name == 'posts' and 'Score' in sampled_df.columns:
                     scores = pd.to_numeric(sampled_df['Score'], errors='coerce').fillna(0.0).astype(float).values
                     embeddings = scores.reshape(-1, 1).tolist()
@@ -118,11 +118,10 @@ class RelBenchSimpleStackGenerator(DataGenerator):
                     scores = pd.to_numeric(sampled_df['Score'], errors='coerce').fillna(0.0).astype(float).values
                     embeddings = scores.reshape(-1, 1).tolist()
                 else:
-                    embeddings = np.zeros((len(sampled_df), 1)).tolist()
+                    embeddings = np.ones((len(sampled_df), 1)).tolist()
                 
                 sampled_df['Embeddings'] = embeddings
                 
-                # Drop explosive values
                 for col in sampled_df.columns:
                     if col == 'ID' or col == 'Embeddings':
                         continue
@@ -143,6 +142,39 @@ class RelBenchSimpleStackGenerator(DataGenerator):
                 )
             )
         return instances
+
+
+class FocalLossWithLogits(nn.Module):
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        pt = torch.exp(-bce_loss) 
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
+
+def _get_pos_weight_loss(train_problems):
+    all_labels = []
+    for p in train_problems:
+        if p.expected_properties:
+            all_labels.extend(list(p.expected_properties.values()))
+            
+    if not all_labels:
+        return nn.BCEWithLogitsLoss()
+        
+    total = len(all_labels)
+    positives = sum(all_labels)
+    
+    if positives == 0 or positives == total:
+        return nn.BCEWithLogitsLoss()
+        
+    # For highly imbalanced graphs, use Focal Loss
+    # Alpha balances positive/negative class importance
+    alpha = positives / total if positives < total / 2 else 0.25
+    return FocalLossWithLogits(alpha=alpha, gamma=2.0)
 
 
 def main_relbench():
@@ -166,7 +198,7 @@ def main_relbench():
         db = dataset.get_db()
         
         print("Generating simple instances (No NLP)...")
-        generator = RelBenchSimpleStackGenerator(db=db, n_instances=12, sample_frac=0.05, rng_seed=42, max_value_freq=100)
+        generator = RelBenchSimpleStackGenerator(db=db, n_instances=12, sample_frac=0.08, rng_seed=42, max_value_freq=100)
         instances = generator.generate()
         
         train_rdb = instances[:10]
@@ -193,7 +225,8 @@ def main_relbench():
         print("Cache saved successfully!")
 
     print("\nStarting Experiment...")
-    config = TrainingConfig(hidden_dim=32, num_layers=3, lr=1e-2, epochs=50, batch_size=4)
+    loss_fn = _get_pos_weight_loss(train_problems)
+    config = TrainingConfig(hidden_dim=64, num_layers=5, lr=1e-2, epochs=25, batch_size=1)
     algorithms = get_default_algorithms()
     
     experiment = ExperimentRunner(
@@ -201,7 +234,8 @@ def main_relbench():
         test_problems=test_problems,
         algorithms=algorithms,
         training_config=config,
-        task_name=task_name
+        task_name=task_name,
+        loss_fn=loss_fn
     )
     
     experiment.run()
@@ -226,7 +260,7 @@ def main():
     )
 
     problem_gen = SharedAttributesProblemGenerator(N=3)
-  
+    problem_gen = MoreThanNeighborsProblemGenerator(N=4)
     print("Generating data and attaching labels...")
     train_rdb = train_gen.generate()
     test_rdb = test_gen.generate()
@@ -234,7 +268,8 @@ def main():
     train_problems = [problem_gen.generate_problem_from_rdb(rdb) for rdb in train_rdb]
     test_problems = [problem_gen.generate_problem_from_rdb(rdb) for rdb in test_rdb]
 
-    config = TrainingConfig(hidden_dim=32, num_layers=3, lr=1e-2, epochs=100, batch_size=16)
+    loss_fn = _get_pos_weight_loss(train_problems)
+    config = TrainingConfig(hidden_dim=32, num_layers=3, lr=1e-2, epochs=35, batch_size=16)
     algorithms = get_default_algorithms()
     
     experiment = ExperimentRunner(
@@ -242,7 +277,8 @@ def main():
         test_problems=test_problems,
         algorithms=algorithms,
         training_config=config,
-        task_name=problem_gen.name
+        task_name=problem_gen.name,
+        loss_fn=loss_fn
     )
     
     experiment.run()

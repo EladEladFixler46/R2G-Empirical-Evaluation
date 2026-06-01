@@ -14,21 +14,20 @@ from r2g_eval.algorithms import BaseR2GAlgorithm
 from r2g_eval.models import GraphInstance, ProblemInstance, RDBInstance
 
 
-# ──────────────────────────────────────────────
-# 1.  MPNN Layer
-# ──────────────────────────────────────────────
+from torch_geometric.utils import add_self_loops
+
+import os
+import shutil
+import tempfile
+import uuid
+from torch.utils.data import Dataset
 
 class MPNNLayer(MessagePassing):
-    """
-    Single message-passing layer.
-    Aggregation: sum over neighbours.
-    Update:      sigmoid squashing to prevent value explosion.
-    """
-
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__(aggr="add")          
         self.linear = nn.Linear(in_channels * 2, out_channels)
-        self.activation = nn.PReLU()          
+        self.activation = nn.PReLU()
+        self.norm = nn.BatchNorm1d(out_channels)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         return self.propagate(edge_index, x=x)
@@ -37,19 +36,10 @@ class MPNNLayer(MessagePassing):
         return self.activation(self.linear(torch.cat([x_i, x_j], dim=-1)))
 
     def update(self, aggr_out: torch.Tensor) -> torch.Tensor:          
-        return torch.sigmoid(aggr_out)
+        return self.norm(aggr_out)
 
-
-# ──────────────────────────────────────────────
-# 2.  Full MPNN (Configurable Layers)
-# ──────────────────────────────────────────────
 
 class MPNN(nn.Module):
-    """
-    Configurable MPNN that ends with a per-node scalar prediction (sigmoid output).
-    hidden_dim controls the width of all intermediate representations.
-    """
-
     def __init__(self, in_channels: int = 1, hidden_dim: int = 32, num_layers: int = 3):
         super().__init__()
         layers = []
@@ -64,15 +54,10 @@ class MPNN(nn.Module):
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
             x = layer(x, edge_index)
-        return torch.sigmoid(self.head(x)).squeeze(-1)   
+        return self.head(x).squeeze(-1)   
 
-
-# ──────────────────────────────────────────────
-# 3.  Helper: build a PyG Data object
-# ──────────────────────────────────────────────
 
 def _graph_instance_to_pyg(gi: GraphInstance) -> Data:
-    """Convert a GraphInstance to a torch_geometric.data.Data object."""
     return Data(
         x=gi.embeddings.float(),
         edge_index=gi.edge_index,
@@ -84,12 +69,10 @@ def _problem_to_labelled_pyg(
     pi: ProblemInstance,
     algorithm: BaseR2GAlgorithm,
 ) -> tuple[Data, dict[int, float]]:
-    """
-    Run the R2G algorithm on a ProblemInstance's RDB data and attach
-    node-level labels as a tensor aligned with node indices.
-    """
     gi = algorithm._run(pi.rdb_instance)
     data = _graph_instance_to_pyg(gi)
+
+    data.edge_index, _ = add_self_loops(data.edge_index, num_nodes=data.num_nodes)
 
     y = torch.full((data.num_nodes,), float("nan"))
     mask = torch.zeros(data.num_nodes, dtype=torch.bool)
@@ -114,32 +97,22 @@ def _problem_to_labelled_pyg(
     return data, id_to_node
 
 
-# ──────────────────────────────────────────────
-# 4.  Trained model wrapper
-# ──────────────────────────────────────────────
-
 @dataclass
 class TrainedMPNNModel:
-    """
-    Wraps a trained MPNN together with the R2G algorithm used during training.
-    Exposes a simple `.predict(rdb_instance)` method.
-    """
-
     mpnn: MPNN
     algorithm: BaseR2GAlgorithm
     device: torch.device
 
     def predict(self, rdb_instance: RDBInstance) -> dict[str, float]:
-        """
-        Convert an RDBInstance to a graph, run the MPNN, and return
-        a dict mapping row ID -> predicted probability.
-        """
         gi = self.algorithm._run(rdb_instance)
-        data = _graph_instance_to_pyg(gi).to(self.device)
+        data = _graph_instance_to_pyg(gi)
+        data.edge_index, _ = add_self_loops(data.edge_index, num_nodes=data.num_nodes)
+        data = data.to(self.device)
 
         self.mpnn.eval()
         with torch.no_grad():
-            preds = self.mpnn(data.x, data.edge_index)   
+            logits = self.mpnn(data.x, data.edge_index)   
+            preds = torch.sigmoid(logits)
 
         return {
             gi.node_to_id[node_idx]: preds[node_idx].item()
@@ -147,9 +120,24 @@ class TrainedMPNNModel:
         }
 
 
-# ──────────────────────────────────────────────
-# 5.  Training
-# ──────────────────────────────────────────────
+class RAMGraphDataset(Dataset):
+    def __init__(self, problems: list[ProblemInstance], algorithm: BaseR2GAlgorithm, split_name: str = "train"):
+        print(f"Pre-computing {split_name} graphs into RAM ({len(problems)} instances)...")
+        self._cache: list[Data] = []
+        for p in problems:
+            data, _ = _problem_to_labelled_pyg(p, algorithm)
+            self._cache.append(data)
+        print(f"  Done - {len(self._cache)} graphs cached.")
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+    def __getitem__(self, idx: int) -> Data:
+        return self._cache[idx]
+
+    def cleanup(self) -> None:
+        pass
+
 
 def _get_default_device() -> str:
     if torch.cuda.is_available():
@@ -173,33 +161,36 @@ def train(
     test_problems:  list[ProblemInstance],
     algorithm:      BaseR2GAlgorithm,
     config:         TrainingConfig | None = None,
+    loss_fn:        nn.Module | None = None,
 ) -> tuple[TrainedMPNNModel, dict[str, Any]]:
-    """
-    Train an MPNN with SGD on the supplied training problems using fast PyG DataLoaders.
-    """
     if config is None:
         config = TrainingConfig()
 
     device = torch.device(config.device)
     print(f"Training on device: {device}")
 
-    print("Pre-converting training graphs ...")
-    train_data = [_problem_to_labelled_pyg(p, algorithm)[0] for p in train_problems]
-    print("Pre-converting test graphs ...")
-    test_data  = [_problem_to_labelled_pyg(p, algorithm)[0] for p in test_problems]
+    train_data = RAMGraphDataset(train_problems, algorithm, split_name="train")
+    test_data  = RAMGraphDataset(test_problems,  algorithm, split_name="test")
 
     from torch_geometric.loader import DataLoader
-    train_loader = DataLoader(train_data, batch_size=config.batch_size, shuffle=True)
-    test_loader = DataLoader(test_data, batch_size=config.batch_size, shuffle=False)
+    num_workers = 0 if os.name == "nt" else 2
+    train_loader = DataLoader(train_data, batch_size=config.batch_size, shuffle=True,  num_workers=num_workers, pin_memory=False)
+    test_loader  = DataLoader(test_data,  batch_size=config.batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
+
+    first_train_graph = train_data[0]
+    in_channels = 1 if not hasattr(first_train_graph, 'x') or first_train_graph.x.shape[1] == 0 else first_train_graph.x.shape[1]
 
     mpnn = MPNN(
-        in_channels=1 if not hasattr(train_data[0], 'x') or train_data[0].x.shape[1] == 0 else train_data[0].x.shape[1], 
+        in_channels=in_channels, 
         hidden_dim=config.hidden_dim, 
         num_layers=config.num_layers
     ).to(device)
     
-    optimiser = torch.optim.SGD(mpnn.parameters(), lr=config.lr)
-    loss_fn   = nn.BCELoss()
+    optimiser = torch.optim.Adam(mpnn.parameters(), lr=config.lr)
+    
+    if loss_fn is None:
+        loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = loss_fn.to(device)
 
     history: dict[str, list[float]] = {"train_loss": [], "test_loss": []}
 
@@ -214,9 +205,9 @@ def train(
                 continue
 
             optimiser.zero_grad()
-            preds  = mpnn(data.x, data.edge_index)
+            logits  = mpnn(data.x, data.edge_index)
             y_true = data.y[data.labelled_mask]
-            y_pred = preds[data.labelled_mask]
+            y_pred = logits[data.labelled_mask]
             loss   = loss_fn(y_pred, y_true)
             loss.backward()
             optimiser.step()
@@ -235,9 +226,9 @@ def train(
                 data = data.to(device)
                 if data.labelled_mask.sum() == 0:
                     continue
-                preds  = mpnn(data.x, data.edge_index)
+                logits  = mpnn(data.x, data.edge_index)
                 y_true = data.y[data.labelled_mask]
-                y_pred = preds[data.labelled_mask]
+                y_pred = logits[data.labelled_mask]
                 loss   = loss_fn(y_pred, y_true)
                 
                 total_test_loss += loss.item()
@@ -259,14 +250,8 @@ def train(
     return trained_model, history
 
 
-# ──────────────────────────────────────────────
-# 6.  Evaluation
-# ──────────────────────────────────────────────
-
 @dataclass
 class EvaluationResults:
-    """Rich evaluation report for a trained model on a set of problems."""
-
     accuracy:          float
     precision:         float
     recall:            float
@@ -275,6 +260,8 @@ class EvaluationResults:
     avg_loss:          float
     threshold:         float
     per_instance:      list[dict[str, Any]] = field(default_factory=list)
+    y_true:            list[float] = field(default_factory=list)
+    y_prob:            list[float] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = [
@@ -297,16 +284,17 @@ def evaluate(
     model:    TrainedMPNNModel,
     problems: list[ProblemInstance],
     threshold: float = 0.5,
+    loss_fn:   nn.Module | None = None,
 ) -> EvaluationResults:
-    """
-    Evaluate a TrainedMPNNModel on a list of ProblemInstances.
-    """
     from sklearn.metrics import (
         accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
     )
 
     device   = model.device
-    loss_fn  = nn.BCELoss()
+    
+    if loss_fn is None:
+        loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = loss_fn.to(device)
 
     all_true:  list[float] = []
     all_pred:  list[float] = []
@@ -316,9 +304,12 @@ def evaluate(
     with torch.no_grad():
         for pi in problems:
             gi   = model.algorithm._run(pi.rdb_instance)
-            data = _graph_instance_to_pyg(gi).to(device)
+            data = _graph_instance_to_pyg(gi)
+            data.edge_index, _ = add_self_loops(data.edge_index, num_nodes=data.num_nodes)
+            data = data.to(device)
 
-            preds: torch.Tensor = model.mpnn(data.x, data.edge_index)
+            logits: torch.Tensor = model.mpnn(data.x, data.edge_index)
+            preds: torch.Tensor = torch.sigmoid(logits)
 
             id_to_node: dict[str, int] = {v: k for k, v in gi.node_to_id.items()}
 
@@ -337,13 +328,13 @@ def evaluate(
                 
             indices = [id_to_node[k] for k in valid_keys]
             inst_true = valid_vals.tolist()
-            inst_pred = preds[indices].tolist()
+            inst_logits = logits[indices]
+            inst_probs = preds[indices].tolist()
 
-            t_arr = torch.tensor(inst_true)
-            p_arr = torch.tensor(inst_pred)
-            inst_loss = loss_fn(p_arr, t_arr).item()
+            t_arr = torch.tensor(inst_true, dtype=torch.float, device=device)
+            inst_loss = loss_fn(inst_logits, t_arr).item()
 
-            bin_pred = [1 if p >= threshold else 0 for p in inst_pred]
+            bin_pred = [1 if p >= threshold else 0 for p in inst_probs]
 
             per_instance.append({
                 "instance_id":  pi.instance_id,
@@ -354,20 +345,22 @@ def evaluate(
             })
 
             all_true.extend(inst_true)
-            all_pred.extend(inst_pred)
+            all_pred.extend(inst_probs)
 
     if not all_true:
         return EvaluationResults(
             accuracy=0, precision=0, recall=0, f1=0,
             auc_roc=0, avg_loss=0, threshold=threshold,
             per_instance=per_instance,
+            y_true=[], y_prob=[]
         )
 
     y_true = np.array(all_true)
     y_prob = np.array(all_pred)
     y_bin  = (y_prob >= threshold).astype(int)
 
-    avg_loss  = loss_fn(torch.tensor(y_prob), torch.tensor(y_true)).item()
+    bce_loss = nn.BCELoss()
+    avg_loss  = bce_loss(torch.tensor(y_prob, dtype=torch.float), torch.tensor(y_true, dtype=torch.float)).item()
     accuracy  = accuracy_score(y_true, y_bin)
     precision = precision_score(y_true, y_bin, zero_division=0)
     recall    = recall_score(y_true, y_bin, zero_division=0)
@@ -387,4 +380,6 @@ def evaluate(
         avg_loss=avg_loss,
         threshold=threshold,
         per_instance=per_instance,
+        y_true=all_true,
+        y_prob=all_pred,
     )
